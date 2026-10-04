@@ -686,7 +686,7 @@ def load_crosswalks(conn, sources, pkmap, kinds: list[str]) -> None:
 
 
 # ----------------------------------------------------------------------------- main
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", nargs="*", type=Path, default=[DATA_DIR],
                     help="directories and/or .mdb files (default: $MCD_DATA_DIR or ./data)")
@@ -695,7 +695,7 @@ def main() -> int:
     ap.add_argument("--init-schema", action="store_true", help="create the schema if it does not exist")
     ap.add_argument("--reset-schema", action="store_true", help="DROP and recreate schema mcd (destroys chunks!)")
     ap.add_argument("--dry-run", action="store_true", help="do everything, then roll back")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     sources = discover_sources(args.source)
     if not sources:

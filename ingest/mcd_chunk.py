@@ -437,7 +437,7 @@ def apply_batch(conn, plan: dict) -> None:
                         plan["insert"])
 
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dsn")
     ap.add_argument("--types", nargs="+", choices=["LCD", "ART", "NCD"], default=["LCD", "ART", "NCD"])
@@ -457,7 +457,7 @@ def main() -> int:
     ap.add_argument("--no-prune", action="store_true", help="keep chunks of documents no longer selected")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--batch", type=int, default=100, help="documents per batch")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     cfg = Cfg(target=args.target_chars, hard=args.max_chars, overlap=args.overlap_chars,
               max_code_chunks=args.max_code_chunks, code_chunks=not args.no_code_chunks,

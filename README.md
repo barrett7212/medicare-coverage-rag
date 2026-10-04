@@ -51,7 +51,7 @@ flowchart LR
     C --> D[(PostgreSQL<br/>relational tables)]
     D --> E[mcd_chunk.py]
     E --> F[doc_chunk]
-    F --> G[mcd_embed.py<br/>TODO]
+    F --> G[mcd_embed.py]
     G --> H[(pgvector)]
     D --> I[MCP server<br/>TODO]
     H --> I
@@ -104,7 +104,7 @@ Developed for an **Apple M2 Max, 32 GB RAM** MacBook. Everything (Postgres, embe
 | Component | Version | Purpose |
 |---|---|---|
 | Python | 3.10+ (developed on 3.12) | ETL, chunking, embedding, MCP server |
-| PostgreSQL | 16 | Relational + vector store |
+| PostgreSQL | 17 | Relational + vector store |
 | pgvector | 0.6+ (HNSW index required; newer is better) | Vector similarity |
 | mdbtools | any recent | Reads the Access `.mdb` files (`mdb-export`) |
 | Ollama | latest | Local LLM and embedding server |
@@ -133,7 +133,8 @@ Python packages are in [`ingest/requirements.txt`](ingest/requirements.txt): `ps
 | Download latest datasets | `ingest/mcd_fetch.py` | Done |
 | ETL (`.mdb`/CSV to Postgres) | `ingest/mcd_etl.py` | Done, tested on the real `.mdb` files |
 | Chunking | `ingest/mcd_chunk.py` | Done, tested on the real data |
-| Embedding | `ingest/mcd_embed.py` | **TODO** |
+| Embedding | `ingest/mcd_embed.py` | Done, **not yet run against a real database** |
+| Fetch + ETL + chunking + embedding in one command | `ingest/mcd_pipeline.py` | Done |
 | MCP server | `server/` | **TODO** |
 | Agent example | `examples/` | **TODO** |
 | Evaluation set | `eval/` | **TODO** |
@@ -141,8 +142,8 @@ Python packages are in [`ingest/requirements.txt`](ingest/requirements.txt): `ps
 ### Step 1: Install dependencies (macOS)
 
 ```bash
-brew install postgresql@16 pgvector mdbtools ollama
-brew services start postgresql@16
+brew install postgresql@17 pgvector mdbtools ollama
+brew services start postgresql@17
 ```
 <!-- TODO: Linux / Windows (WSL) instructions -->
 
@@ -162,6 +163,22 @@ export MCD_DSN="postgresql://localhost/mcd"
 ```
 
 The schema (and the `vector` / `pg_trgm` extensions) is created by the ETL's `--init-schema` flag in step 4.
+
+### Steps 3 to 6 in one command
+
+`ingest/mcd_pipeline.py` runs the fetch, the ETL, the chunking and the embedding in order and stops at the first stage that fails. The embedding stage needs Ollama running with the embedding model pulled (see [step 6](#step-6-host-the-local-models-and-embed)); pass `--skip-embed` to stop after chunking. Read the licensing notes above first: `--accept-licenses` is your acceptance of the agreements on the downloads page.
+
+```bash
+python ingest/mcd_pipeline.py --accept-licenses              # download, load, chunk and embed everything
+python ingest/mcd_pipeline.py --accept-licenses --retired    # "Current and Retired" LCD/Article variants
+python ingest/mcd_pipeline.py --accept-licenses --only ncd   # just one dataset
+python ingest/mcd_pipeline.py --skip-fetch                   # datasets are already in ./data
+python ingest/mcd_pipeline.py --accept-licenses --skip-embed # stop after chunking (Ollama not needed)
+```
+
+It creates the schema if it does not exist, so the same command serves the first load and the [weekly refresh](#weekly-refresh). After it finishes, continue with step 7.
+
+Steps 3 to 6 below describe the individual stages. Run them separately when you want their extra options (`--dry-run`, `--show`, `--limit`, chunk sizes, and so on); the pipeline has no `--dry-run` of its own.
 
 ### Step 3: Get the data
 
@@ -215,9 +232,12 @@ ollama pull <chat-model>                  # TODO: pick a model
 ```
 
 ```bash
-python ingest/mcd_embed.py                       # TODO: not written yet
+python ingest/mcd_embed.py                       # every chunk without an embedding for the model
+python ingest/mcd_embed.py --dry-run             # count what would be embedded, write nothing
 ```
-<!-- TODO: expected embedding time on M2 Max; batch size; resume behavior -->
+
+Each chunk is embedded as its `heading_path` plus its content, with the `search_document: ` prefix that `nomic-embed-text` is trained with (queries must use `search_query: `). The run is incremental and resumable: only chunks without an embedding for the model are sent, identical text (same `content_hash`) is embedded once, and every batch (`--batch`, default 64) is committed, so an interrupted run continues where it stopped. A model whose dimension does not match the `vector(768)` column is refused before anything is written.
+<!-- TODO: expected embedding time on M2 Max -->
 
 ### Step 7: Run the MCP server
 
@@ -262,13 +282,16 @@ NCDs are national, so their `state_abbrevs` is empty by design. Filter with `doc
 |---|---|---|
 | `MCD_DSN` | `postgresql://localhost/mcd` | Postgres connection string |
 | `MCD_DATA_DIR` | `./data` | Where datasets are downloaded to and where the ETL looks for them |
+| `MCD_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model, also stored in `chunk_embedding.model` |
+| `OLLAMA_HOST` | `http://localhost:11434` | Where `mcd_embed.py` reaches Ollama |
 
 ### Weekly refresh
 
 ```bash
-python ingest/mcd_fetch.py --accept-licenses
-python ingest/mcd_etl.py && python ingest/mcd_chunk.py   # && python ingest/mcd_embed.py
+python ingest/mcd_pipeline.py --accept-licenses
 ```
+
+Datasets whose ETag is unchanged are not downloaded again, unchanged documents keep their IDs, and only chunks whose text changed are rewritten and embedded again.
 
 ---
 
@@ -280,8 +303,9 @@ ingest/
   mcd_fetch.py        CMS downloads page -> ./data
   mcd_etl.py          datasets -> Postgres
   mcd_chunk.py        policy text -> doc_chunk
+  mcd_embed.py        doc_chunk -> chunk_embedding (Ollama)
+  mcd_pipeline.py     fetch -> ETL -> chunk -> embed in one command
   requirements.txt
-  # planned: mcd_embed.py
 server/
   mcd_schema.sql      PostgreSQL + pgvector schema
   # planned: MCP server
@@ -293,7 +317,8 @@ data/                 downloaded datasets (gitignored; do not commit)
 ## Roadmap
 
 - [x] `mcd_fetch.py`: download latest datasets with explicit license acceptance
-- [ ] `mcd_embed.py`: Ollama embeddings with reuse by content hash
+- [x] `mcd_embed.py`: Ollama embeddings with reuse by content hash
+- [x] `mcd_pipeline.py`: fetch, ETL, chunking and embedding in one command
 - [ ] MCP server with read-only role and focused tools
 - [ ] Agentic example (TODO: framework)
 - [ ] Code-set loader for the `code_ref` table

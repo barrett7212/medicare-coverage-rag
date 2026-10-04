@@ -335,7 +335,7 @@ def fetch_one(session: requests.Session, kind: str, info: dict, dest: Path, fmt:
     return True
 
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--accept-licenses", action="store_true",
                     help="you have read and accept the AMA (CPT), ADA (CDT) and AHA/NUBC (UB-04) "
@@ -349,7 +349,7 @@ def main() -> int:
                     help="which copy of the data to unpack (default: mdb if mdbtools is installed, else csv)")
     ap.add_argument("--force", action="store_true", help="download even if the ETag is unchanged")
     ap.add_argument("--list", action="store_true", help="list the datasets on the downloads page and exit")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     session = RobotsSession()
 

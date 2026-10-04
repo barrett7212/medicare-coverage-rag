@@ -3,3 +3,6 @@ data/
 
 # Python bytecode
 __pycache__/
+
+# Python .venv
+.venv/
