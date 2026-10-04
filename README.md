@@ -17,7 +17,7 @@ A pipeline and schema that turn the CMS **Medicare Coverage Database (MCD)** bul
 
 - **Relational layer** (PostgreSQL): documents, MACs, jurisdictions, and every code list (CPT/HCPCS, ICD-10-CM/PCS, revenue, bill type), queryable by exact code and state.
 - **Vector layer** (pgvector): chunked policy text with embeddings, for semantic and hybrid (vector + keyword) search.
-- **Agent layer** *(TODO)*: an MCP server and an example agent that combine the two.
+- **Agent layer**: an MCP server that combines the two, and an example agent *(TODO)*.
 
 Everything is designed to run on a single laptop with local models.
 
@@ -53,7 +53,7 @@ flowchart LR
     E --> F[doc_chunk]
     F --> G[mcd_embed.py]
     G --> H[(pgvector)]
-    D --> I[MCP server<br/>TODO]
+    D --> I[MCP server]
     H --> I
     I --> J[Local LLM / agent<br/>TODO]
 ```
@@ -109,8 +109,8 @@ Developed for an **Apple M2 Max, 32 GB RAM** MacBook. Everything (Postgres, embe
 | mdbtools | any recent | Reads the Access `.mdb` files (`mdb-export`) |
 | Ollama | latest | Local LLM and embedding server |
 
-Python packages are in [`ingest/requirements.txt`](ingest/requirements.txt): `psycopg[binary]`, `pgvector`, `beautifulsoup4`, `lxml`, `requests`.
-<!-- TODO: add MCP SDK, agent framework (LangGraph?) once chosen -->
+Python packages are in [`ingest/requirements.txt`](ingest/requirements.txt) (`psycopg[binary]`, `pgvector`, `beautifulsoup4`, `lxml`, `requests`) and [`server/requirements.txt`](server/requirements.txt) (`mcp` 2.x, `psycopg[binary]`, `requests`).
+<!-- TODO: add agent framework (LangGraph?) once chosen -->
 
 ### Models
 
@@ -135,7 +135,7 @@ Python packages are in [`ingest/requirements.txt`](ingest/requirements.txt): `ps
 | Chunking | `ingest/mcd_chunk.py` | Done, tested on the real data |
 | Embedding | `ingest/mcd_embed.py` | Done, **not yet run against a real database** |
 | Fetch + ETL + chunking + embedding in one command | `ingest/mcd_pipeline.py` | Done |
-| MCP server | `server/` | **TODO** |
+| MCP server | `server/mcd_server.py` | Done |
 | Agent example | `examples/` | **TODO** |
 | Evaluation set | `eval/` | **TODO** |
 
@@ -241,8 +241,39 @@ Each chunk is embedded as its `heading_path` plus its content, with the `search_
 
 ### Step 7: Run the MCP server
 
-<!-- TODO: server/ with read-only Postgres role. Planned tools:
-     lookup_code(code, state), search_policies(query, state, doc_type), get_policy(public_id) -->
+```bash
+pip install -r server/requirements.txt
+python server/mcd_server.py                # stdio transport; normally launched by the MCP client
+```
+
+[`server/mcd_server.py`](server/mcd_server.py) exposes the database to an agent through five tools:
+
+| Tool | Layer | Purpose |
+|---|---|---|
+| `lookup_code(code, state, code_system)` | structured | Active LCDs/Articles that list an exact CPT/HCPCS, ICD-10, modifier, revenue or bill-type code in a state, with the code's role, the group's note, and related documents |
+| `list_policy_codes(public_id, code_system, role, starts_with)` | structured | The code lists of one policy (e.g. which diagnoses support a procedure) |
+| `search_policy_text(query_text, state, doc_type, public_ids)` | chunks | Hybrid search (pgvector + full-text, reciprocal rank fusion) over the policy text, restricted to national NCDs plus the documents that apply in the state |
+| `get_policy(public_id)` | structured | Status, dates, jurisdiction, MACs, related and referencing documents, code-list counts, section index |
+| `get_policy_text(public_id, section, offset)` | chunks | One section of a policy in full, paged |
+
+`state` accepts an abbreviation or a name. A whole state also matches its CMS sub-jurisdictions (`CA` matches `CA`, `NF`, `SF`). Searches cover currently effective, non-draft documents only (`v_active_policy`).
+
+Every query runs in a read-only transaction with a 30-second timeout. If Ollama is not reachable, `search_policy_text` returns keyword-only results and says so.
+<!-- TODO: dedicated read-only Postgres role -->
+
+To register it with an MCP client, use the virtualenv's interpreter and absolute paths. For example, in a project `.mcp.json` (Claude Code) or `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "mcd": {
+      "command": "/path/to/mcd-rag/.venv/bin/python",
+      "args": ["/path/to/mcd-rag/server/mcd_server.py"],
+      "env": { "MCD_DSN": "postgresql://localhost/mcd" }
+    }
+  }
+}
+```
 
 ### Step 8: Run the agent example
 
@@ -282,8 +313,8 @@ NCDs are national, so their `state_abbrevs` is empty by design. Filter with `doc
 |---|---|---|
 | `MCD_DSN` | `postgresql://localhost/mcd` | Postgres connection string |
 | `MCD_DATA_DIR` | `./data` | Where datasets are downloaded to and where the ETL looks for them |
-| `MCD_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model, also stored in `chunk_embedding.model` |
-| `OLLAMA_HOST` | `http://localhost:11434` | Where `mcd_embed.py` reaches Ollama |
+| `MCD_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model, also stored in `chunk_embedding.model`; the server embeds queries with it |
+| `OLLAMA_HOST` | `http://localhost:11434` | Where `mcd_embed.py` and the MCP server reach Ollama |
 
 ### Weekly refresh
 
@@ -308,7 +339,8 @@ ingest/
   requirements.txt
 server/
   mcd_schema.sql      PostgreSQL + pgvector schema
-  # planned: MCP server
+  mcd_server.py       MCP server (read-only tools over the database)
+  requirements.txt
 examples/             planned: agent example
 eval/                 planned: evaluation set
 data/                 downloaded datasets (gitignored; do not commit)
@@ -319,7 +351,8 @@ data/                 downloaded datasets (gitignored; do not commit)
 - [x] `mcd_fetch.py`: download latest datasets with explicit license acceptance
 - [x] `mcd_embed.py`: Ollama embeddings with reuse by content hash
 - [x] `mcd_pipeline.py`: fetch, ETL, chunking and embedding in one command
-- [ ] MCP server with read-only role and focused tools
+- [x] MCP server with focused, read-only tools
+- [ ] Dedicated read-only Postgres role for the MCP server
 - [ ] Agentic example (TODO: framework)
 - [ ] Code-set loader for the `code_ref` table
 - [ ] Evaluation set and retrieval metrics
