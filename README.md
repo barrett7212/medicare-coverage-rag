@@ -31,7 +31,7 @@ The MCD is CMS's repository of coverage policy. It is published as weekly bulk d
 | **LCD** (Local Coverage Determination) | A regional MAC | One MAC's jurisdiction | Local medical-necessity criteria, documentation requirements |
 | **Article** | A regional MAC | One MAC's jurisdiction | Billing and coding guidance, including the ICD-10 and CPT/HCPCS code lists that back an LCD |
 
-Snapshot used during development (data as of 09/27/2026): ~980 LCDs, ~2,070 Articles, 357 NCD versions, ~510k code rows, ~52k text chunks for active documents. Full data dictionaries are in the downloads page; the schema is in [`mcd_schema.sql`](mcd_schema.sql).
+Snapshot used during development (data as of 09/27/2026): ~980 LCDs, ~2,070 Articles, 357 NCD versions, ~510k code rows, ~52k text chunks for active documents. Full data dictionaries are in the downloads page; the schema is in [`server/mcd_schema.sql`](server/mcd_schema.sql).
 
 ### Why this is a good RAG use case
 
@@ -46,7 +46,7 @@ Snapshot used during development (data as of 09/27/2026): ~980 LCDs, ~2,070 Arti
 
 ```mermaid
 flowchart LR
-    A[CMS MCD downloads<br/>.mdb / CSV] --> B[mcd_fetch.py<br/>TODO]
+    A[CMS MCD downloads<br/>.mdb / CSV] --> B[mcd_fetch.py]
     B --> C[mcd_etl.py]
     C --> D[(PostgreSQL<br/>relational tables)]
     D --> E[mcd_chunk.py]
@@ -109,7 +109,7 @@ Developed for an **Apple M2 Max, 32 GB RAM** MacBook. Everything (Postgres, embe
 | mdbtools | any recent | Reads the Access `.mdb` files (`mdb-export`) |
 | Ollama | latest | Local LLM and embedding server |
 
-Python packages are in [`requirements.txt`](requirements.txt): `psycopg[binary]`, `pgvector`, `beautifulsoup4`, `lxml`, `requests`.
+Python packages are in [`ingest/requirements.txt`](ingest/requirements.txt): `psycopg[binary]`, `pgvector`, `beautifulsoup4`, `lxml`, `requests`.
 <!-- TODO: add MCP SDK, agent framework (LangGraph?) once chosen -->
 
 ### Models
@@ -129,11 +129,11 @@ Python packages are in [`requirements.txt`](requirements.txt): `psycopg[binary]`
 
 | Step | Script | Status |
 |---|---|---|
-| Schema | `mcd_schema.sql` | Done, tested on PostgreSQL 16 |
-| Download latest datasets | `mcd_fetch.py` | **TODO** |
-| ETL (`.mdb`/CSV to Postgres) | `mcd_etl.py` | Done, tested on the real `.mdb` files |
-| Chunking | `mcd_chunk.py` | Done, tested on the real data |
-| Embedding | `mcd_embed.py` | **TODO** |
+| Schema | `server/mcd_schema.sql` | Done, tested on PostgreSQL 16 |
+| Download latest datasets | `ingest/mcd_fetch.py` | Done |
+| ETL (`.mdb`/CSV to Postgres) | `ingest/mcd_etl.py` | Done, tested on the real `.mdb` files |
+| Chunking | `ingest/mcd_chunk.py` | Done, tested on the real data |
+| Embedding | `ingest/mcd_embed.py` | **TODO** |
 | MCP server | `server/` | **TODO** |
 | Agent example | `examples/` | **TODO** |
 | Evaluation set | `eval/` | **TODO** |
@@ -149,8 +149,10 @@ brew services start postgresql@16
 ```bash
 git clone <repo-url> && cd mcd-rag
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r ingest/requirements.txt
 ```
+
+The commands below are run from the repository root, so datasets land in `./data` there.
 
 ### Step 2: Create the database
 
@@ -163,9 +165,17 @@ The schema (and the `vector` / `pg_trgm` extensions) is created by the ETL's `--
 
 ### Step 3: Get the data
 
-**Automatic** *(TODO: `mcd_fetch.py`)*: will scrape the downloads page for the latest ZIPs, require an explicit license-acceptance flag, and cache by ETag.
+**Automatic:** `ingest/mcd_fetch.py` scrapes the downloads page for the latest ZIPs, unpacks them into `./data`, and caches by ETag so unchanged datasets are skipped on re-runs. It honors `robots.txt` and requires an explicit license-acceptance flag.
 
-**Manual (works today):**
+```bash
+python ingest/mcd_fetch.py --accept-licenses              # current LCDs, Articles and NCDs
+python ingest/mcd_fetch.py --accept-licenses --retired    # "Current and Retired" LCD/Article variants
+python ingest/mcd_fetch.py --list                         # show what the downloads page offers
+```
+
+It unpacks the `.mdb` files when mdbtools is installed and the CSVs otherwise (`--format` overrides this); `--dest` changes the target directory.
+
+**Manual:**
 1. Open the [downloads page](https://www.cms.gov/medicare-coverage-database/downloads/downloads.aspx) and accept the license agreements.
 2. Download **Current LCD Data**, **Current Article Data**, and **Current NCD Data**. (The "Current and Retired" variants also work.)
 3. Unzip each into `./data/` (the `.mdb` files are what the ETL reads).
@@ -180,8 +190,8 @@ data/
 ### Step 4: Run the ETL
 
 ```bash
-python mcd_etl.py --init-schema          # reads ./data by default
-# or: python mcd_etl.py --init-schema --source /path/to/*.mdb
+python ingest/mcd_etl.py --init-schema          # reads ./data by default
+# or: python ingest/mcd_etl.py --init-schema --source /path/to/*.mdb
 # preview without committing: add --dry-run
 ```
 
@@ -190,8 +200,8 @@ Expect about a minute or two. The ETL is idempotent and safe to re-run for the w
 ### Step 5: Chunk the text
 
 ```bash
-python mcd_chunk.py                       # active, non-draft documents
-python mcd_chunk.py --show L33252         # preview one document's chunks, writes nothing
+python ingest/mcd_chunk.py                       # active, non-draft documents
+python ingest/mcd_chunk.py --show L33252         # preview one document's chunks, writes nothing
 ```
 
 On the development snapshot this produced ~52k chunks (median ~940 characters) in about 20 seconds. Re-running only touches chunks whose text changed.
@@ -205,7 +215,7 @@ ollama pull <chat-model>                  # TODO: pick a model
 ```
 
 ```bash
-python mcd_embed.py                       # TODO: not written yet
+python ingest/mcd_embed.py                       # TODO: not written yet
 ```
 <!-- TODO: expected embedding time on M2 Max; batch size; resume behavior -->
 
@@ -251,13 +261,13 @@ NCDs are national, so their `state_abbrevs` is empty by design. Filter with `doc
 | Variable | Default | Purpose |
 |---|---|---|
 | `MCD_DSN` | `postgresql://localhost/mcd` | Postgres connection string |
-| `MCD_DATA_DIR` | `./data` | Where the ETL looks for datasets |
+| `MCD_DATA_DIR` | `./data` | Where datasets are downloaded to and where the ETL looks for them |
 
 ### Weekly refresh
 
 ```bash
-# TODO: python mcd_fetch.py --accept-licenses
-python mcd_etl.py && python mcd_chunk.py   # && python mcd_embed.py
+python ingest/mcd_fetch.py --accept-licenses
+python ingest/mcd_etl.py && python ingest/mcd_chunk.py   # && python ingest/mcd_embed.py
 ```
 
 ---
@@ -265,18 +275,24 @@ python mcd_etl.py && python mcd_chunk.py   # && python mcd_embed.py
 ## Repository layout
 
 ```
-mcd_schema.sql      PostgreSQL + pgvector schema
-mcd_common.py       shared helpers (DB, HTML-to-text, .mdb/CSV readers)
-mcd_etl.py          datasets -> Postgres
-mcd_chunk.py        policy text -> doc_chunk
-requirements.txt
-data/               downloaded datasets (gitignored; do not commit)
-# planned: mcd_fetch.py, mcd_embed.py, server/, examples/, eval/
+ingest/
+  mcd_common.py       shared helpers (DB, HTML-to-text, .mdb/CSV readers)
+  mcd_fetch.py        CMS downloads page -> ./data
+  mcd_etl.py          datasets -> Postgres
+  mcd_chunk.py        policy text -> doc_chunk
+  requirements.txt
+  # planned: mcd_embed.py
+server/
+  mcd_schema.sql      PostgreSQL + pgvector schema
+  # planned: MCP server
+examples/             planned: agent example
+eval/                 planned: evaluation set
+data/                 downloaded datasets (gitignored; do not commit)
 ```
 
 ## Roadmap
 
-- [ ] `mcd_fetch.py`: download latest datasets with explicit license acceptance
+- [x] `mcd_fetch.py`: download latest datasets with explicit license acceptance
 - [ ] `mcd_embed.py`: Ollama embeddings with reuse by content hash
 - [ ] MCP server with read-only role and focused tools
 - [ ] Agentic example (TODO: framework)

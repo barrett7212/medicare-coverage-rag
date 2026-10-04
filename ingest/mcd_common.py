@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
 
 DSN = os.environ.get("MCD_DSN", "postgresql://localhost/mcd")
 DATA_DIR = Path(os.environ.get("MCD_DATA_DIR", "data"))
-SCHEMA_FILE = Path(__file__).with_name("mcd_schema.sql")
+SCHEMA_FILE = Path(__file__).resolve().parent.parent / "server" / "mcd_schema.sql"
 
 csv.field_size_limit(sys.maxsize)
 

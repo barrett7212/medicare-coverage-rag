@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ETL: CMS MCD downloads (.mdb or CSV) -> PostgreSQL (schema in mcd_schema.sql).
+"""ETL: CMS MCD downloads (.mdb or CSV) -> PostgreSQL (schema in server/mcd_schema.sql).
 
 Typical use
     python mcd_etl.py --init-schema                    # reads ./data (see mcd_fetch.py)
