@@ -1,0 +1,5 @@
+# mcp is the 2.x client the server uses; langchain-mcp-adapters is left out because it pins mcp 1.x
+langchain>=1.0
+langchain-ollama>=1.0
+langfuse>=4.0
+mcp>=2.0
