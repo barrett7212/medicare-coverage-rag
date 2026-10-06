@@ -1,6 +1,9 @@
 # Downloaded MCD datasets (licensed third-party content; never commit)
 data/
 
+# Evaluation run output (contains retrieved policy text; never commit)
+eval/results/
+
 # Python bytecode
 __pycache__/
 

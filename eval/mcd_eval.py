@@ -6,6 +6,8 @@
     python eval/mcd_eval.py --only mcd-007       # chosen items
     python eval/mcd_eval.py --no-judge           # deterministic scores only (no judge model calls)
 
+Needs eval/requirements.txt (the agent's packages plus ragas).
+
 With LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY set (LANGFUSE_BASE_URL selects the instance), the eval
 set is upserted as the Langfuse dataset --dataset and the run is recorded as a dataset run: one trace
 per item (model turns, tool calls, tokens, latency) with the scores below attached. Without keys the
@@ -17,8 +19,11 @@ Scores per item
   retrieval_recall     share of the expected public_ids that any tool result returned
   tool_selection       1 when one of the expected tools was called
   state_filter         1 when the state in the question was passed to a tool (items with a state)
-  correctness          judge model: the answer agrees with the reference answer
-  faithfulness         judge model: every claim in the answer is supported by the tool results
+  answered             1 when the agent returned a non-empty answer
+  clean_output         1 when the answer has no leaked model markup (chat-template tokens, raw tool calls)
+  faithfulness         RAGAS Faithfulness: share of the answer's claims that the tool results support
+  factual_correctness  RAGAS FactualCorrectness (recall): share of the reference's claims that the answer supports
+  context_recall       RAGAS ContextRecall: share of the reference's claims found in the tool results
   latency_s, tool_calls, total_tokens, completed
 Scores per run: averages of the above (reported by Langfuse), latency_p95_s.
 """
@@ -33,46 +38,20 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from langchain_ollama import ChatOllama
 from langfuse import Evaluation, get_client
-from pydantic import BaseModel, Field
+from openai import AsyncOpenAI
+from ragas.llms import llm_factory
+from ragas.metrics.collections import ContextRecall, FactualCorrectness, Faithfulness
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
-from mcd_agent import CHAT_MODEL, NUM_CTX, OLLAMA_HOST, ask, langfuse_enabled, mcd_agent  # noqa: E402
+from mcd_agent import CHAT_MODEL, OLLAMA_HOST, ask, langfuse_enabled, mcd_agent  # noqa: E402
 
 EVAL_SET = Path(__file__).with_name("mcd_eval_set.jsonl")
-JUDGE_MODEL = os.environ.get("MCD_JUDGE_MODEL", CHAT_MODEL)
+JUDGE_MODEL = os.environ.get("MCD_JUDGE_MODEL", "qwen3:8b")
 PUBLIC_ID = re.compile(r"\b([LA]\d{5})\b|\bNCD\s*(\d+(?:\.\d+)*)", re.IGNORECASE)
 JUDGE_EVIDENCE_CHARS = 24000   # tool results shown to the judge, cut to fit its context window
-
-JUDGE_PROMPT = """\
-You grade an assistant that answers Medicare coverage policy questions from retrieved policy documents.
-
-Question:
-{question}
-
-Reference answer:
-{reference}
-
-Tool results the assistant retrieved:
-{evidence}
-
-Assistant answer:
-{answer}
-
-Grade two things independently.
-correct: the assistant answer agrees with the reference answer on every fact the reference states \
-(policy ids, yes/no, numbers). Extra detail is fine. A contradiction, a missing fact or a refusal is not correct.
-faithful: every factual claim in the assistant answer is supported by the tool results. A claim that \
-appears nowhere in the tool results makes it unfaithful, even if it happens to be true."""
-
-
-class Verdict(BaseModel):
-    correct: bool
-    correct_reason: str = Field(description="one sentence")
-    faithful: bool
-    faithful_reason: str = Field(description="one sentence")
-
+JUDGE_MAX_TOKENS = 4096        # room for the claim lists the RAGAS prompts ask the judge to write
+LEAKED_MARKUP = re.compile(r"<\|[^|>\n]*\|>|【|】|\bto=functions\.")   # chat-template tokens, raw tool calls
 
 def public_ids(text: str) -> set[str]:
     """'see l33718 and NCD240.4.' -> {'L33718', 'NCD 240.4'}"""
@@ -137,7 +116,12 @@ def tool_use(*, input, output, expected_output, metadata, **kwargs) -> list[Eval
 
 
 def performance(*, input, output, expected_output, metadata, **kwargs) -> list[Evaluation]:
-    out = [Evaluation(name="completed", value=float("error" not in output), comment=output.get("error"))]
+    answer = output["answer"]
+    leaked = sorted({m.group(0) for m in LEAKED_MARKUP.finditer(answer)})
+    out = [Evaluation(name="completed", value=float("error" not in output), comment=output.get("error")),
+           Evaluation(name="answered", value=float(bool(answer.strip())),
+                      comment=None if answer.strip() else "empty answer"),
+           Evaluation(name="clean_output", value=float(not leaked), comment=f"leaked markup: {leaked or 'none'}")]
     if "error" not in output:
         out += [Evaluation(name="latency_s", value=output["latency_s"]),
                 Evaluation(name="tool_calls", value=len(output["tool_calls"])),
@@ -145,19 +129,48 @@ def performance(*, input, output, expected_output, metadata, **kwargs) -> list[E
     return out
 
 
-def make_judge(model: str):
-    llm = ChatOllama(model=model, base_url=OLLAMA_HOST, temperature=0, num_ctx=NUM_CTX).with_structured_output(Verdict)
+def contexts(output) -> list[str]:
+    """Tool results as RAGAS retrieved_contexts, cut to JUDGE_EVIDENCE_CHARS in total."""
+    out, room = [], JUDGE_EVIDENCE_CHARS
+    for text in output["tool_results"]:
+        if room <= 0:
+            break
+        out.append(text[:room])
+        room -= len(text)
+    return out or ["(no tool was called)"]
 
-    async def judge(*, input, output, expected_output, metadata, **kwargs) -> list[Evaluation]:
+
+def make_ragas(model: str) -> list:
+    """One evaluator per RAGAS metric, so a failed judge call costs one score and not all three."""
+    # Ollama's OpenAI-compatible endpoint: it ignores the key and takes its context window from the
+    # server (OLLAMA_CONTEXT_LENGTH), not from the request.
+    client = AsyncOpenAI(base_url=f"{OLLAMA_HOST.rstrip('/')}/v1", api_key="ollama")
+    # reasoning_effort: a thinking model otherwise spends its output budget before it reaches the verdict
+    llm = llm_factory(model, provider="openai", client=client, temperature=0, max_tokens=JUDGE_MAX_TOKENS,
+                      reasoning_effort="none")
+    faithful = Faithfulness(llm=llm)
+    correct = FactualCorrectness(llm=llm, mode="recall")   # recall: detail beyond the reference is not penalized
+    recall = ContextRecall(llm=llm)
+
+    async def faithfulness(*, input, output, expected_output, metadata, **kwargs) -> Evaluation:
         if not output["answer"]:
-            return [Evaluation(name="correctness", value=0.0, comment="no answer"),
-                    Evaluation(name="faithfulness", value=0.0, comment="no answer")]
-        evidence = "\n---\n".join(output["tool_results"])[:JUDGE_EVIDENCE_CHARS] or "(no tool was called)"
-        v = await llm.ainvoke(JUDGE_PROMPT.format(question=input["question"], reference=expected_output["answer"],
-                                                  evidence=evidence, answer=output["answer"]))
-        return [Evaluation(name="correctness", value=float(v.correct), comment=v.correct_reason),
-                Evaluation(name="faithfulness", value=float(v.faithful), comment=v.faithful_reason)]
-    return judge
+            return Evaluation(name="faithfulness", value=0.0, comment="no answer")
+        r = await faithful.ascore(user_input=input["question"], response=output["answer"],
+                                  retrieved_contexts=contexts(output))
+        return Evaluation(name="faithfulness", value=r.value)
+
+    async def factual_correctness(*, input, output, expected_output, metadata, **kwargs) -> Evaluation:
+        if not output["answer"]:
+            return Evaluation(name="factual_correctness", value=0.0, comment="no answer")
+        r = await correct.ascore(response=output["answer"], reference=expected_output["answer"])
+        return Evaluation(name="factual_correctness", value=r.value)
+
+    async def context_recall(*, input, output, expected_output, metadata, **kwargs) -> Evaluation:
+        r = await recall.ascore(user_input=input["question"], retrieved_contexts=contexts(output),
+                                reference=expected_output["answer"])
+        return Evaluation(name="context_recall", value=r.value)
+
+    return [faithfulness, factual_correctness, context_recall]
 
 
 def latency_p95(*, item_results, **kwargs) -> Evaluation:
@@ -172,8 +185,8 @@ def latency_p95(*, item_results, **kwargs) -> Evaluation:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", default=CHAT_MODEL, help=f"Ollama chat model under test (default {CHAT_MODEL})")
-    ap.add_argument("--judge-model", default=JUDGE_MODEL, help=f"Ollama model that grades answers (default {JUDGE_MODEL})")
-    ap.add_argument("--no-judge", action="store_true", help="skip correctness / faithfulness")
+    ap.add_argument("--judge-model", default=JUDGE_MODEL, help=f"Ollama model behind the RAGAS metrics (default {JUDGE_MODEL})")
+    ap.add_argument("--no-judge", action="store_true", help="skip the RAGAS metrics")
     ap.add_argument("--dataset", default="mcd-coverage-qa", help="Langfuse dataset name")
     ap.add_argument("--run-name", help="Langfuse run name (default: experiment name + timestamp)")
     ap.add_argument("--only", nargs="+", metavar="ID", help="item ids to run")
@@ -183,7 +196,7 @@ def main() -> int:
     args = ap.parse_args()
 
     items = load_items(args.only, args.limit)
-    evaluators = [citations, tool_use, performance] + ([] if args.no_judge else [make_judge(args.judge_model)])
+    evaluators = [citations, tool_use, performance] + ([] if args.no_judge else make_ragas(args.judge_model))
     run = dict(name=f"mcd-agent/{args.model}", run_name=args.run_name, task=make_task(args.model),
                description="examples/mcd_agent.py on eval/mcd_eval_set.jsonl",
                evaluators=evaluators, run_evaluators=[latency_p95], max_concurrency=args.concurrency,

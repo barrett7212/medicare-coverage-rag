@@ -41,6 +41,7 @@ NCD_COVERAGE = {1: "full coverage", 2: "restricted coverage", 3: "no coverage"}
 CODE_SYSTEMS = ("HCPCS", "HCPCS_MOD", "ICD10CM", "ICD10PCS", "REV", "BILL")
 RRF_K = 60          # reciprocal rank fusion constant
 CANDIDATES = 50     # per-ranker candidates fed into the fusion
+MAX_CODES = 100     # codes per list_policy_codes page; a full list overflows a local model's context
 
 mcp = MCPServer("mcd", instructions="""\
 Medicare coverage policy from the CMS Medicare Coverage Database: National Coverage Determinations
@@ -243,17 +244,22 @@ def lookup_code(code: str, state: Optional[str] = None, code_system: Optional[st
 
 @mcp.tool()
 def list_policy_codes(public_id: str, code_system: Optional[str] = None, role: Optional[str] = None,
-                      starts_with: Optional[str] = None, limit: int = 100) -> dict:
+                      starts_with: Optional[str] = None, limit: int = 50, offset: int = 0) -> dict:
     """List the codes attached to one LCD or Article, e.g. to check which diagnoses support a procedure.
+
+    To check whether one code is on a list, pass the code as starts_with instead of reading the whole
+    list: lists run to hundreds of codes and are returned a page at a time.
 
     Args:
         public_id: Document id such as 'A57520' or 'L33252'.
         code_system: HCPCS (includes CPT), HCPCS_MOD, ICD10CM, ICD10PCS, REV or BILL.
         role: 'covered' or 'noncovered' (ICD-10 lists) or 'listed' (everything else).
-        starts_with: Code prefix filter, e.g. 'E11' for all type 2 diabetes diagnoses.
-        limit: Maximum number of codes to return (1-500).
+        starts_with: Code or code prefix filter, e.g. 'E11.9', or 'E11' for all type 2 diabetes diagnoses.
+        limit: Maximum number of codes to return (1-100).
+        offset: Number of matching codes to skip, to continue a truncated list.
 
-    Returns a count per code_system / role / group (always complete) and the matching codes.
+    Returns a count per code_system / role / group (always complete), the number of codes that match
+    the filters and one page of them.
     """
     doc = find_doc(public_id)
     system = code_system.strip().upper() if code_system else None
@@ -262,9 +268,11 @@ def list_policy_codes(public_id: str, code_system: Optional[str] = None, role: O
     role = role.strip().lower() if role else None
     if role and role not in ("listed", "covered", "noncovered"):
         raise ToolError("role must be 'listed', 'covered' or 'noncovered'")
-    limit = clamp(limit, 1, 500)
+    limit = clamp(limit, 1, MAX_CODES)
+    offset = max(0, offset)
+    prefix = starts_with.strip().upper() if starts_with else None
     params = {"pk": doc["doc_pk"], "system": system, "role": role,
-              "prefix": starts_with.strip().upper() + "%" if starts_with else None, "limit": limit + 1}
+              "prefix": prefix + "%" if prefix else None, "limit": limit, "offset": offset}
     where = """doc_pk = %(pk)s
           AND (%(system)s::text IS NULL OR code_system = %(system)s)
           AND (%(role)s::text IS NULL OR role = %(role)s)
@@ -275,9 +283,18 @@ def list_policy_codes(public_id: str, code_system: Optional[str] = None, role: O
     codes = query(f"""SELECT code_system, role, group_no AS "group", code,
                              COALESCE(description, short_description) AS description
                       FROM policy_code WHERE {where}
-                      ORDER BY code_system, role, group_no, code LIMIT %(limit)s""", params)
+                      ORDER BY code_system, role, group_no, code
+                      LIMIT %(limit)s OFFSET %(offset)s""", params)
+    matching = query(f"SELECT count(*) AS n FROM policy_code WHERE {where}", params)[0]["n"]
+    shown = offset + len(codes)
     out = {"public_id": doc["public_id"], "title": doc["title"], "code_lists": summary,
-           "codes": codes[:limit], "truncated": len(codes) > limit}
+           "matching_codes": matching, "codes": codes, "truncated": shown < matching}
+    if shown < matching:
+        out["note"] = (f"Codes {offset + 1}-{shown} of {matching}. Continue with offset={shown}, or pass a code "
+                       "as starts_with to check whether it is listed.")
+    elif summary and not matching and prefix:
+        out["note"] = (f"No code starting with {prefix!r} matches these filters: it is not on the list. "
+                       "ICD-10 codes are stored with the dot (E11.9).")
     if not summary:
         rel = related_docs([doc["doc_pk"]]).get(doc["doc_pk"], [])
         out["note"] = "This document has no code lists; its codes are usually in a related Article."
